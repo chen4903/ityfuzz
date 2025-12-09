@@ -228,7 +228,7 @@ impl Chain {
             Chain::ETH => "https://eth.merkle.io",
             Chain::GOERLI => "https://rpc.ankr.com/eth_goerli",
             Chain::SEPOLIA => "https://rpc.ankr.com/eth_sepolia",
-            Chain::BSC => "https://bnb.api.onfinality.io/public",
+            Chain::BSC => "https://bsc-rpc.publicnode.com",
             Chain::CHAPEL => "https://rpc.ankr.com/bsc_testnet_chapel",
             Chain::POLYGON => "https://polygon.llamarpc.com",
             Chain::MUMBAI => "https://rpc-mumbai.maticvigil.com/",
@@ -749,7 +749,7 @@ impl OnChainConfig {
         {
             return None;
         }
-        
+
         let endpoint = if self.etherscan_base.contains("/v2/api") {
             format!(
                 "{}?chainid={}&module=contract&action=getabi&address={:?}&format=json&apikey={}",
@@ -774,33 +774,44 @@ impl OnChainConfig {
                 }
             )
         };
-        
+
         info!("fetching abi from {}", endpoint);
-        match self.get(endpoint.clone()) {
-            Some(resp) => {
-                let json = serde_json::from_str::<Value>(&resp);
-                match json {
-                    Ok(json) => {
-                        let result_parsed = json["result"].as_str();
-                        match result_parsed {
-                            Some(result) => {
-                                if result == "Contract source code not verified" {
-                                    None
-                                } else {
-                                    Some(result.to_string())
-                                }
-                            }
-                            _ => None,
-                        }
-                    }
-                    Err(_) => None,
-                }
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(1));
             }
-            None => {
-                error!("failed to fetch abi from {}", endpoint);
-                None
+
+            let resp = match self.get(endpoint.clone()) {
+                Some(resp) => resp,
+                None => continue, // Request failed, retry
+            };
+
+            let json: Value = match serde_json::from_str(&resp) {
+                Ok(json) => json,
+                Err(_) => continue, // JSON parse error, retry
+            };
+
+            let status_ok = json["status"].as_str() == Some("1");
+            let message_ok = json["message"].as_str() == Some("OK");
+            if !status_ok || !message_ok {
+                continue; // status/message not OK, retry
             }
+
+            let result = match json["result"].as_str() {
+                Some(result) => result,
+                None => continue, // result field missing or invalid, retry
+            };
+
+            if result == "Contract source code not verified" {
+                return None;
+            }
+
+            // debug!("abi fetched: {}", result);
+            return Some(result.to_string());
         }
+
+        error!("failed to fetch abi from {} after 3 attempts", endpoint);
+        None
     }
 
     fn blockscout_fetch_abi_uncached(&self, address: EVMAddress) -> Option<String> {
@@ -854,14 +865,18 @@ impl OnChainConfig {
                 .build()
                 .expect("Failed to create HTTP client");
 
-            return client
+            debug!(">> {} {}", self.endpoint_url, data);
+            let resp = client
                 .post(&self.endpoint_url)
                 .header("Content-Type", "application/json")
-                .body(data)
+                .body(data.clone())
                 .send()
                 .ok()
-                .and_then(|resp| resp.text().ok())
-                .and_then(|resp| serde_json::from_str(&resp).ok())
+                .and_then(|resp| resp.text().ok())?;
+            debug!("<< {}", resp);
+
+            return serde_json::from_str(&resp)
+                .ok()
                 .and_then(|json: Value| json.get("result").cloned());
         }
         // Handling IPC request
@@ -1148,12 +1163,13 @@ impl OnChainConfig {
             return "".to_string();
         }
 
-        info!("fetching code from {}", hex::encode(address));
+        info!("eth_getCode 0x{}", hex::encode(address));
 
         let resp_string = {
             let mut params = String::from("[");
             params.push_str(&format!("\"0x{:x}\",", address));
             params.push_str(&format!("\"{}\"", self.block_number));
+            // params.push_str("\"latest\"");
             params.push(']');
             let resp = self._request("eth_getCode".to_string(), params);
             match resp {
@@ -1161,7 +1177,10 @@ impl OnChainConfig {
                     let code = resp.as_str().unwrap();
                     code.to_string()
                 }
-                None => "".to_string(),
+                None => {
+                    info!("empty code for address 0x{:x}", address);
+                    "".to_string()
+                }
             }
         }
         .trim_start_matches("0x")
@@ -1226,20 +1245,21 @@ impl OnChainConfig {
         if self.pair_cache.contains_key(&EVMAddress::from_str(&token).unwrap()) {
             return self.pair_cache[&EVMAddress::from_str(&token).unwrap()].clone();
         }
-        info!("fetching pairs for {token}");
         let url = if is_pegged {
             format!("https://pairs-all.infra.fuzz.land/single_pair/{network}/{token}/{weth}")
         } else {
             format!("https://pairs-all.infra.fuzz.land/pairs/{network}/{token}")
         };
-        // info!("{url}");
+        debug!(">> {url}");
         let resp: Value = reqwest::blocking::get(url).unwrap().json().unwrap();
+        debug!("<< {}", resp.to_string());
         let mut pairs: Vec<PairData> = Vec::new();
         if let Some(resp_pairs) = resp.as_array() {
             for item in resp_pairs {
                 let pair = item["pair"].as_str().unwrap().to_string();
                 let code = self.get_contract_code(EVMAddress::from_str(&pair).unwrap(), false);
                 if code.is_empty() {
+                    info!("skip pair {pair} due to empty code");
                     continue;
                 }
                 let token0 = item["token0"].as_str().unwrap().to_string();
@@ -1279,6 +1299,8 @@ impl OnChainConfig {
         }
         self.pair_cache
             .insert(EVMAddress::from_str(&token).unwrap(), pairs.clone());
+
+        info!(?pairs, "fetched {} pairs for {}", pairs.len(), token);
         pairs
     }
 
